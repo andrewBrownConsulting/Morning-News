@@ -1,4 +1,4 @@
-"""Daily news digest: fetch RSS feeds, let an LLM pick what Andy would enjoy, email the top stories.
+"""Daily morning briefing: calendar, weather, and news an LLM thinks Andy would enjoy, by email.
 
 Usage:
     python3 digest.py            # fetch, score, send email
@@ -18,6 +18,11 @@ from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
+
+import icalendar
+import recurring_ical_events
 
 HERE = Path(__file__).parent
 
@@ -40,6 +45,17 @@ FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "gemini-3.5-flash-lite")
 RETRY_DELAYS = [10, 30]  # seconds to wait before each retry on overload/timeout
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 ATOM = "{http://www.w3.org/2005/Atom}"
+TZ = ZoneInfo("Europe/London")
+WEATHER_LOCATION = os.environ.get("WEATHER_LOCATION", "London")
+WEATHER_CODES = {
+    0: "☀️ Clear", 1: "🌤️ Mostly clear", 2: "⛅ Partly cloudy", 3: "☁️ Overcast",
+    45: "🌫️ Fog", 48: "🌫️ Fog", 51: "🌦️ Light drizzle", 53: "🌦️ Drizzle", 55: "🌦️ Heavy drizzle",
+    56: "🌧️ Freezing drizzle", 57: "🌧️ Freezing drizzle", 61: "🌧️ Light rain", 63: "🌧️ Rain",
+    65: "🌧️ Heavy rain", 66: "🌧️ Freezing rain", 67: "🌧️ Freezing rain", 71: "🌨️ Light snow",
+    73: "🌨️ Snow", 75: "🌨️ Heavy snow", 77: "🌨️ Snow grains", 80: "🌦️ Showers", 81: "🌦️ Showers",
+    82: "⛈️ Heavy showers", 85: "🌨️ Snow showers", 86: "🌨️ Snow showers", 95: "⛈️ Thunderstorm",
+    96: "⛈️ Thunderstorm with hail", 99: "⛈️ Thunderstorm with hail",
+}
 
 
 def load_dotenv():
@@ -119,6 +135,62 @@ class Retryable(Exception):
     """A temporary API failure (overloaded, rate-limited, timed out) worth retrying."""
 
 
+def fetch_calendar():
+    """Today's and tomorrow's events from a published iCloud (or any iCal) calendar link."""
+    url = os.environ.get("ICAL_URL", "").replace("webcal://", "https://")
+    if not url:
+        return None
+    cal = icalendar.Calendar.from_ical(http_get(url))
+    today = datetime.now(TZ).date()
+    days = {}
+    for day in (today, today + timedelta(days=1)):
+        events = []
+        for ev in recurring_ical_events.of(cal).at(day):
+            start = ev["DTSTART"].dt
+            if isinstance(start, datetime):
+                if start.tzinfo:
+                    start = start.astimezone(TZ)
+                if start.date() < day:
+                    label = "(cont.)"  # started on an earlier day
+                else:
+                    label = start.strftime("%H:%M")
+            else:
+                label = "All day"
+            events.append((label, str(ev.get("SUMMARY", "(no title)"))))
+        # All-day and continuing events first, then by time
+        days[day] = sorted(events, key=lambda e: (e[0][0].isdigit(), e[0]))
+    return days
+
+
+def fetch_weather():
+    """Today's forecast for WEATHER_LOCATION from Open-Meteo (free, no key)."""
+    geo = json.loads(http_get("https://geocoding-api.open-meteo.com/v1/search?"
+                              + urlencode({"name": WEATHER_LOCATION, "count": 1})))
+    place = geo["results"][0]
+    params = urlencode({
+        "latitude": place["latitude"],
+        "longitude": place["longitude"],
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,"
+                 "precipitation_probability_max,wind_speed_10m_max",
+        "timezone": "Europe/London",
+        "past_days": 1,
+        "forecast_days": 1,
+    })
+    d = json.loads(http_get(f"https://api.open-meteo.com/v1/forecast?{params}"))["daily"]
+    # Index 0 is yesterday (for rock dryness), index 1 is today
+    rain_yesterday, rain_today = d["precipitation_sum"][0] or 0, d["precipitation_sum"][1] or 0
+    return {
+        "place": place["name"],
+        "summary": WEATHER_CODES.get(d["weather_code"][1], "🌡️ Mixed"),
+        "high": round(d["temperature_2m_max"][1]),
+        "low": round(d["temperature_2m_min"][1]),
+        "rain_chance": d["precipitation_probability_max"][1] or 0,
+        "rain_mm": rain_today,
+        "wind": round(d["wind_speed_10m_max"][1]),
+        "rock_dry": rain_yesterday < 1 and rain_today < 1,
+    }
+
+
 def score_batch(stories, profile, api_key, model):
     """Ask the LLM to score each headline 0-10 for how much Andy would enjoy it."""
     headlines = "\n".join(f"{i}. [{s['source']}] {s['title']}" for i, s in enumerate(stories))
@@ -187,8 +259,34 @@ def score_all(stories, profile, api_key):
     return sorted(scored, key=lambda s: s["score"], reverse=True)[:TOP_N]
 
 
-def build_html(picks, apology=None):
-    today = datetime.now().strftime("%A %-d %B")
+def calendar_html(days):
+    if days is None:
+        return ""
+    parts = []
+    for day, events in days.items():
+        label = "Today" if day == datetime.now(TZ).date() else "Tomorrow"
+        if events:
+            lines = "".join(
+                f'<div style="padding:2px 0"><span style="color:#666;display:inline-block;width:64px">{html.escape(t)}</span>{html.escape(title)}</div>'
+                for t, title in events)
+        else:
+            lines = '<div style="color:#666">Nothing planned</div>'
+        parts.append(f'<div style="margin-bottom:8px"><b>{label}</b>{lines}</div>')
+    return f'<h3 style="margin-bottom:6px">📅 Calendar</h3>{"".join(parts)}'
+
+
+def weather_html(w):
+    if w is None:
+        return ""
+    rock = "🧗 Rock should be dry" if w["rock_dry"] else "🧗 Rock likely wet, so maybe an indoor day"
+    return f"""<h3 style="margin-bottom:6px">Weather in {html.escape(w['place'])}</h3>
+      <div style="font-size:18px">{w['summary']} · {w['high']}° / {w['low']}°</div>
+      <div style="color:#666;font-size:14px;margin-top:2px">Rain {w['rain_chance']}% ({w['rain_mm']:.1f} mm) · Wind up to {w['wind']} km/h</div>
+      <div style="font-size:14px;margin-top:4px">{rock}</div>"""
+
+
+def build_html(picks, apology=None, calendar=None, weather=None):
+    today = datetime.now(TZ).strftime("%A %-d %B")
     rows = "".join(
         f"""<tr><td style="padding:12px 0;border-bottom:1px solid #eee">
           <a href="{html.escape(s['link'])}" style="font-size:16px;color:#1a0dab;text-decoration:none;font-weight:600">{html.escape(s['title'])}</a>
@@ -197,7 +295,11 @@ def build_html(picks, apology=None):
         for s in picks
     )
     return f"""<html><body style="font-family:-apple-system,Segoe UI,sans-serif;max-width:600px;margin:auto;padding:16px">
-      <h2 style="margin-bottom:4px">Your news, {today}</h2>
+      <h2 style="margin-bottom:4px">Good morning, Andy</h2>
+      <p style="color:#666;margin-top:0">{today}</p>
+      {calendar_html(calendar)}
+      {weather_html(weather)}
+      <h3 style="margin-bottom:6px">📰 News</h3>
       {f'<p style="background:#fff4e5;border-left:4px solid #f0a020;padding:10px 12px">{html.escape(apology)}</p>' if apology else f'<p style="color:#666;margin-top:0">{len(picks)} stories picked for you</p>'}
       <table style="width:100%;border-collapse:collapse">{rows}</table>
     </body></html>"""
@@ -221,6 +323,19 @@ def main():
     if not api_key:
         sys.exit("API_KEY is not set (add it to .env or GitHub secrets)")
 
+    calendar = weather = None
+    try:
+        calendar = fetch_calendar()
+        print("Calendar: " + ("skipped (no ICAL_URL)" if calendar is None else
+                              ", ".join(f"{len(e)} events" for e in calendar.values())))
+    except Exception as e:
+        print(f"  ! calendar failed: {e}")
+    try:
+        weather = fetch_weather()
+        print(f"Weather: {weather['place']} {weather['summary']}")
+    except Exception as e:
+        print(f"  ! weather failed: {e}")
+
     print("Fetching feeds...")
     stories = fetch_all()
     print(f"Scoring {len(stories)} stories with {MODEL}...")
@@ -238,7 +353,7 @@ def main():
     if not picks:
         sys.exit("No stories were fetched, so there's nothing to send")
 
-    body = build_html(picks, apology)
+    body = build_html(picks, apology, calendar, weather)
     if dry_run:
         out = HERE / "digest.html"
         out.write_text(body)
