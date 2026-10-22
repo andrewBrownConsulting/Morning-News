@@ -8,9 +8,6 @@ on:
 jobs:
   digest:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      models: read  # lets GITHUB_TOKEN call GitHub Models
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -18,6 +15,6 @@ jobs:
           python-version: "3.12"
       - run: python digest.py
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_KEY: ${{ secrets.GROQ_API_KEY }}
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}

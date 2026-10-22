@@ -10,6 +10,7 @@ import json
 import os
 import smtplib
 import sys
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -31,8 +32,9 @@ FEEDS = {
 TOP_N = 10
 MAX_AGE = timedelta(hours=24)
 BATCH_SIZE = 50
-MODELS_URL = "https://models.github.ai/inference/chat/completions"
-MODEL = os.environ.get("MODEL", "openai/gpt-4o-mini")
+# Any OpenAI-compatible chat completions API works; defaults to Groq's free tier
+API_URL = os.environ.get("API_URL", "https://api.groq.com/openai/v1/chat/completions")
+MODEL = os.environ.get("MODEL", "llama-3.3-70b-versatile")
 ATOM = "{http://www.w3.org/2005/Atom}"
 
 
@@ -124,14 +126,17 @@ def score_batch(stories, profile, api_key):
         "response_format": {"type": "json_object"},
         "temperature": 0.2,
     }).encode()
-    req = urllib.request.Request(MODELS_URL, data=body, headers={
+    req = urllib.request.Request(API_URL, data=body, headers={
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
         "User-Agent": "news-digest/0.1",
     })
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        raise ValueError(f"HTTP {e.code}: {e.read()[:500]!r}") from None
     try:
         content = json.loads(raw)["choices"][0]["message"]["content"] or ""
         # Models sometimes wrap JSON in ```json fences or add text around it
@@ -186,9 +191,9 @@ def send_email(subject, body_html):
 def main():
     load_dotenv()
     dry_run = "--dry-run" in sys.argv
-    api_key = os.environ.get("GITHUB_TOKEN")
+    api_key = os.environ.get("API_KEY")
     if not api_key:
-        sys.exit("GITHUB_TOKEN is not set (automatic in GitHub Actions; locally, add a PAT with models:read to .env)")
+        sys.exit("API_KEY is not set (add it to .env or GitHub secrets)")
 
     print("Fetching feeds...")
     stories = fetch_all()
