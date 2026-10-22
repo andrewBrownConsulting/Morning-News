@@ -1,0 +1,204 @@
+"""Daily news digest: fetch RSS feeds, let an LLM pick what Andy would enjoy, email the top stories.
+
+Usage:
+    python3 digest.py            # fetch, score, send email
+    python3 digest.py --dry-run  # fetch, score, write digest.html instead of emailing
+"""
+
+import html
+import json
+import os
+import smtplib
+import sys
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+
+HERE = Path(__file__).parent
+
+FEEDS = {
+    "BBC": "https://feeds.bbci.co.uk/news/rss.xml",
+    "Guardian": "https://www.theguardian.com/uk/rss",
+    "Hacker News": "https://news.ycombinator.com/rss",
+    "Ars Technica": "https://feeds.arstechnica.com/arstechnica/index",
+    "The Verge": "https://www.theverge.com/rss/index.xml",
+    "Hackaday": "https://hackaday.com/blog/feed/",
+}
+
+TOP_N = 10
+MAX_AGE = timedelta(hours=24)
+BATCH_SIZE = 50
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+ATOM = "{http://www.w3.org/2005/Atom}"
+
+
+def load_dotenv():
+    """Read KEY=value lines from .env (local runs only; GitHub Actions uses secrets)."""
+    env_file = HERE / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            if "=" in line and not line.strip().startswith("#"):
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip())
+
+
+def http_get(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "news-digest/0.1"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read()
+
+
+def parse_date(text):
+    if not text:
+        return None
+    try:
+        return parsedate_to_datetime(text)  # RSS: "Tue, 21 Oct 2026 07:00:00 GMT"
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))  # Atom: ISO 8601
+    except ValueError:
+        return None
+
+
+def fetch_feed(source, url):
+    root = ET.fromstring(http_get(url))
+    stories = []
+    for item in root.iter("item"):  # RSS
+        stories.append({
+            "source": source,
+            "title": (item.findtext("title") or "").strip(),
+            "link": (item.findtext("link") or "").strip(),
+            "date": parse_date(item.findtext("pubDate")),
+        })
+    for entry in root.iter(f"{ATOM}entry"):  # Atom (The Verge)
+        link = entry.find(f"{ATOM}link")
+        stories.append({
+            "source": source,
+            "title": (entry.findtext(f"{ATOM}title") or "").strip(),
+            "link": link.get("href", "") if link is not None else "",
+            "date": parse_date(entry.findtext(f"{ATOM}published") or entry.findtext(f"{ATOM}updated")),
+        })
+    return stories
+
+
+def fetch_all():
+    cutoff = datetime.now(timezone.utc) - MAX_AGE
+    stories, seen = [], set()
+    for source, url in FEEDS.items():
+        try:
+            items = fetch_feed(source, url)
+        except Exception as e:
+            print(f"  ! {source} failed: {e}")
+            continue
+        kept = 0
+        for s in items:
+            key = s["title"].lower()
+            if not s["title"] or not s["link"] or key in seen:
+                continue
+            if s["date"] and s["date"].tzinfo and s["date"] < cutoff:
+                continue  # stories with no date are kept (e.g. Hacker News)
+            seen.add(key)
+            stories.append(s)
+            kept += 1
+        print(f"  {source}: {kept} stories")
+    return stories
+
+
+def score_batch(stories, profile, api_key):
+    """Ask the LLM to score each headline 0-10 for how much Andy would enjoy it."""
+    headlines = "\n".join(f"{i}. [{s['source']}] {s['title']}" for i, s in enumerate(stories))
+    prompt = (
+        f"Here is a reader's taste profile:\n\n{profile}\n\n"
+        f"Score each headline below from 0 to 10 for how much this reader would ENJOY reading it. "
+        f"Give a short reason (max 12 words) addressed to the reader as 'you'.\n\n{headlines}\n\n"
+        'Reply with JSON only: {"scores": [{"id": 0, "score": 7, "reason": "..."}, ...]}'
+    )
+    body = json.dumps({
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
+    }).encode()
+    req = urllib.request.Request(GROQ_URL, data=body, headers={
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "news-digest/0.1",
+    })
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        content = json.load(resp)["choices"][0]["message"]["content"]
+    for entry in json.loads(content).get("scores", []):
+        i = entry.get("id")
+        if isinstance(i, int) and 0 <= i < len(stories):
+            stories[i]["score"] = entry.get("score", 0)
+            stories[i]["reason"] = entry.get("reason", "")
+
+
+def score_all(stories, profile, api_key):
+    for start in range(0, len(stories), BATCH_SIZE):
+        batch = stories[start:start + BATCH_SIZE]
+        try:
+            score_batch(batch, profile, api_key)
+        except Exception as e:
+            print(f"  ! scoring batch {start // BATCH_SIZE + 1} failed: {e}")
+    scored = [s for s in stories if "score" in s]
+    return sorted(scored, key=lambda s: s["score"], reverse=True)[:TOP_N]
+
+
+def build_html(picks):
+    today = datetime.now().strftime("%A %-d %B")
+    rows = "".join(
+        f"""<tr><td style="padding:12px 0;border-bottom:1px solid #eee">
+          <a href="{html.escape(s['link'])}" style="font-size:16px;color:#1a0dab;text-decoration:none;font-weight:600">{html.escape(s['title'])}</a>
+          <div style="font-size:13px;color:#666;margin-top:4px">{html.escape(s['source'])} · {s['score']}/10 · {html.escape(s.get('reason', ''))}</div>
+        </td></tr>"""
+        for s in picks
+    )
+    return f"""<html><body style="font-family:-apple-system,Segoe UI,sans-serif;max-width:600px;margin:auto;padding:16px">
+      <h2 style="margin-bottom:4px">Your news, {today}</h2>
+      <p style="color:#666;margin-top:0">{len(picks)} stories picked for you</p>
+      <table style="width:100%;border-collapse:collapse">{rows}</table>
+    </body></html>"""
+
+
+def send_email(subject, body_html):
+    user = os.environ["GMAIL_ADDRESS"]
+    msg = MIMEText(body_html, "html")
+    msg["Subject"] = subject
+    msg["From"] = user
+    msg["To"] = os.environ.get("DIGEST_TO", user)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(user, os.environ["GMAIL_APP_PASSWORD"].replace(" ", ""))
+        smtp.send_message(msg)
+
+
+def main():
+    load_dotenv()
+    dry_run = "--dry-run" in sys.argv
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        sys.exit("GROQ_API_KEY is not set (add it to .env or GitHub secrets)")
+
+    print("Fetching feeds...")
+    stories = fetch_all()
+    print(f"Scoring {len(stories)} stories with {GROQ_MODEL}...")
+    picks = score_all(stories, (HERE / "profile.txt").read_text(), api_key)
+    if not picks:
+        sys.exit("No stories were scored, so there's nothing to send")
+
+    body = build_html(picks)
+    if dry_run:
+        out = HERE / "digest.html"
+        out.write_text(body)
+        print(f"Dry run: wrote {out}")
+    else:
+        send_email(f"Your news: {picks[0]['title']}", body)
+        print("Email sent")
+
+
+if __name__ == "__main__":
+    main()

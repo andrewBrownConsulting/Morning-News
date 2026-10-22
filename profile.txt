@@ -1,0 +1,14 @@
+Andy, 26, software engineer at Arup (engineering consultancy) in the UK.
+
+Loves:
+- Electronics, microcontrollers (ESP32), smart home, DIY gadgets
+- 3D printing, woodworking, maker projects
+- Climbing and skiing
+- Clever engineering, infrastructure, science and space
+- Software engineering and interesting tech (not hype)
+- Fitness and self-improvement
+
+Not interested in:
+- Celebrity gossip, royals, reality TV
+- Football transfers and routine sports results
+- Product deals and shopping roundups

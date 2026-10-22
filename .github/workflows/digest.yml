@@ -1,0 +1,20 @@
+name: Daily news digest
+
+on:
+  schedule:
+    - cron: "0 6 * * *"  # 06:00 UTC = 07:00 UK summer time / 06:00 winter
+  workflow_dispatch:      # adds a "Run workflow" button for testing
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python digest.py
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
