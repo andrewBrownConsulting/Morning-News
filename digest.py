@@ -10,6 +10,7 @@ import json
 import os
 import smtplib
 import sys
+import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -35,6 +36,9 @@ BATCH_SIZE = 50
 # Any OpenAI-compatible chat completions API works; defaults to Google Gemini's free tier
 API_URL = os.environ.get("API_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
 MODEL = os.environ.get("MODEL", "gemini-3.8-flash")
+FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "gemini-3.5-flash-lite")
+RETRY_DELAYS = [10, 30]  # seconds to wait before each retry on overload/timeout
+RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 ATOM = "{http://www.w3.org/2005/Atom}"
 
 
@@ -111,7 +115,11 @@ def fetch_all():
     return stories
 
 
-def score_batch(stories, profile, api_key):
+class Retryable(Exception):
+    """A temporary API failure (overloaded, rate-limited, timed out) worth retrying."""
+
+
+def score_batch(stories, profile, api_key, model):
     """Ask the LLM to score each headline 0-10 for how much Andy would enjoy it."""
     headlines = "\n".join(f"{i}. [{s['source']}] {s['title']}" for i, s in enumerate(stories))
     prompt = (
@@ -121,7 +129,7 @@ def score_batch(stories, profile, api_key):
         'Reply with JSON only: {"scores": [{"id": 0, "score": 7, "reason": "..."}, ...]}'
     )
     body = json.dumps({
-        "model": MODEL,
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
     }).encode()
@@ -132,10 +140,13 @@ def score_batch(stories, profile, api_key):
         "User-Agent": "news-digest/0.1",
     })
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
-        raise ValueError(f"HTTP {e.code}: {e.read()[:500]!r}") from None
+        error = Retryable if e.code in RETRYABLE_HTTP else ValueError
+        raise error(f"HTTP {e.code}: {e.read()[:300]!r}") from None
+    except (TimeoutError, urllib.error.URLError) as e:
+        raise Retryable(f"network: {e}") from None
     try:
         content = json.loads(raw)["choices"][0]["message"]["content"] or ""
         # Models sometimes wrap JSON in ```json fences or add text around it
@@ -149,11 +160,27 @@ def score_batch(stories, profile, api_key):
             stories[i]["reason"] = entry.get("reason", "")
 
 
+def score_with_retries(stories, profile, api_key):
+    """Try the main model with retries, then the fallback model, before giving up."""
+    for model in (MODEL, FALLBACK_MODEL):
+        for delay in RETRY_DELAYS + [None]:
+            try:
+                score_batch(stories, profile, api_key, model)
+                return
+            except Retryable as e:
+                print(f"    {model}: {str(e)[:80]}")
+                if delay is None:
+                    break
+                print(f"    retrying in {delay}s...")
+                time.sleep(delay)
+    raise RuntimeError("all models and retries failed")
+
+
 def score_all(stories, profile, api_key):
     for start in range(0, len(stories), BATCH_SIZE):
         batch = stories[start:start + BATCH_SIZE]
         try:
-            score_batch(batch, profile, api_key)
+            score_with_retries(batch, profile, api_key)
         except Exception as e:
             print(f"  ! scoring batch {start // BATCH_SIZE + 1} failed: {e}")
     scored = [s for s in stories if "score" in s]
