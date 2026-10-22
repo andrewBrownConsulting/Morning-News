@@ -187,18 +187,18 @@ def score_all(stories, profile, api_key):
     return sorted(scored, key=lambda s: s["score"], reverse=True)[:TOP_N]
 
 
-def build_html(picks):
+def build_html(picks, apology=None):
     today = datetime.now().strftime("%A %-d %B")
     rows = "".join(
         f"""<tr><td style="padding:12px 0;border-bottom:1px solid #eee">
           <a href="{html.escape(s['link'])}" style="font-size:16px;color:#1a0dab;text-decoration:none;font-weight:600">{html.escape(s['title'])}</a>
-          <div style="font-size:13px;color:#666;margin-top:4px">{html.escape(s['source'])} · {s['score']}/10 · {html.escape(s.get('reason', ''))}</div>
+          <div style="font-size:13px;color:#666;margin-top:4px">{html.escape(" · ".join(x for x in (s['source'], f"{s['score']}/10" if 'score' in s else '', s.get('reason', '')) if x))}</div>
         </td></tr>"""
         for s in picks
     )
     return f"""<html><body style="font-family:-apple-system,Segoe UI,sans-serif;max-width:600px;margin:auto;padding:16px">
       <h2 style="margin-bottom:4px">Your news, {today}</h2>
-      <p style="color:#666;margin-top:0">{len(picks)} stories picked for you</p>
+      {f'<p style="background:#fff4e5;border-left:4px solid #f0a020;padding:10px 12px">{html.escape(apology)}</p>' if apology else f'<p style="color:#666;margin-top:0">{len(picks)} stories picked for you</p>'}
       <table style="width:100%;border-collapse:collapse">{rows}</table>
     </body></html>"""
 
@@ -225,16 +225,26 @@ def main():
     stories = fetch_all()
     print(f"Scoring {len(stories)} stories with {MODEL}...")
     picks = score_all(stories, (HERE / "profile.txt").read_text(), api_key)
+    apology = None
+    if picks:
+        subject = f"Your news: {picks[0]['title']}"
+    else:
+        # Failsafe: the AI is down, so send the BBC headlines unfiltered
+        print("No stories were scored; falling back to BBC headlines")
+        picks = [s for s in stories if s["source"] == "BBC"][:TOP_N]
+        apology = ("Sorry, the AI isn't AIing today, so I couldn't pick stories for you. "
+                   "Here are the top BBC headlines instead.")
+        subject = "Your news (AI day off): BBC headlines"
     if not picks:
-        sys.exit("No stories were scored, so there's nothing to send")
+        sys.exit("No stories were fetched, so there's nothing to send")
 
-    body = build_html(picks)
+    body = build_html(picks, apology)
     if dry_run:
         out = HERE / "digest.html"
         out.write_text(body)
         print(f"Dry run: wrote {out}")
     else:
-        send_email(f"Your news: {picks[0]['title']}", body)
+        send_email(subject, body)
         print("Email sent")
 
 
