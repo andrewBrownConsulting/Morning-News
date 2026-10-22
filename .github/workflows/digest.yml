@@ -22,4 +22,4 @@ jobs:
           ICLOUD_USERNAME: ${{ secrets.ICLOUD_USERNAME }}
           ICLOUD_APP_PASSWORD: ${{ secrets.ICLOUD_APP_PASSWORD }}
           ICAL_URL: ${{ secrets.ICAL_URL }}
-          WEATHER_LOCATION: London  # change to your town
+          WEATHER_LOCATION: Hammersmith
