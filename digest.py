@@ -127,11 +127,18 @@ def score_batch(stories, profile, api_key):
     req = urllib.request.Request(MODELS_URL, data=body, headers={
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
         "User-Agent": "news-digest/0.1",
     })
     with urllib.request.urlopen(req, timeout=60) as resp:
-        content = json.load(resp)["choices"][0]["message"]["content"]
-    for entry in json.loads(content).get("scores", []):
+        raw = resp.read().decode("utf-8", errors="replace")
+    try:
+        content = json.loads(raw)["choices"][0]["message"]["content"] or ""
+        # Models sometimes wrap JSON in ```json fences or add text around it
+        result = json.loads(content[content.index("{"):content.rindex("}") + 1])
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        raise ValueError(f"{e}; raw response: {raw[:500]!r}") from None
+    for entry in result.get("scores", []):
         i = entry.get("id")
         if isinstance(i, int) and 0 <= i < len(stories):
             stories[i]["score"] = entry.get("score", 0)
