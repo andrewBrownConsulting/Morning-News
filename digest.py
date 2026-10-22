@@ -32,9 +32,9 @@ FEEDS = {
 TOP_N = 10
 MAX_AGE = timedelta(hours=24)
 BATCH_SIZE = 50
-# Any OpenAI-compatible chat completions API works; defaults to Groq's free tier
-API_URL = os.environ.get("API_URL", "https://api.groq.com/openai/v1/chat/completions")
-MODEL = os.environ.get("MODEL", "llama-3.3-70b-versatile")
+# Any OpenAI-compatible chat completions API works; defaults to Google Gemini's free tier
+API_URL = os.environ.get("API_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+MODEL = os.environ.get("MODEL", "gemini-3.8-flash")
 ATOM = "{http://www.w3.org/2005/Atom}"
 
 
@@ -123,7 +123,6 @@ def score_batch(stories, profile, api_key):
     body = json.dumps({
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"},
         "temperature": 0.2,
     }).encode()
     req = urllib.request.Request(API_URL, data=body, headers={
