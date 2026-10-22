@@ -21,6 +21,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
+import caldav
 import icalendar
 import recurring_ical_events
 
@@ -47,6 +48,8 @@ RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 ATOM = "{http://www.w3.org/2005/Atom}"
 TZ = ZoneInfo("Europe/London")
 WEATHER_LOCATION = os.environ.get("WEATHER_LOCATION", "London")
+CALDAV_URL = os.environ.get("CALDAV_URL", "https://caldav.icloud.com/")
+WRITE_CALENDAR = "Morning Briefing"
 WEATHER_CODES = {
     0: "☀️ Clear", 1: "🌤️ Mostly clear", 2: "⛅ Partly cloudy", 3: "☁️ Overcast",
     45: "🌫️ Fog", 48: "🌫️ Fog", 51: "🌦️ Light drizzle", 53: "🌦️ Drizzle", 55: "🌦️ Heavy drizzle",
@@ -135,12 +138,42 @@ class Retryable(Exception):
     """A temporary API failure (overloaded, rate-limited, timed out) worth retrying."""
 
 
-def fetch_calendar():
-    """Today's and tomorrow's events from a published iCloud (or any iCal) calendar link."""
-    url = os.environ.get("ICAL_URL", "").replace("webcal://", "https://")
-    if not url:
+def caldav_principal():
+    """Log in to iCloud over CalDAV (private, read/write). Returns None if not configured."""
+    user, password = os.environ.get("ICLOUD_USERNAME"), os.environ.get("ICLOUD_APP_PASSWORD")
+    if not (user and password):
         return None
-    cal = icalendar.Calendar.from_ical(http_get(url))
+    client = caldav.DAVClient(url=CALDAV_URL, username=user, password=password.replace(" ", ""))
+    return client.principal()
+
+
+def load_calendar():
+    """All events as one icalendar.Calendar: via CalDAV if configured, else the ICAL_URL link."""
+    principal = caldav_principal()
+    if principal is None:
+        url = os.environ.get("ICAL_URL", "").replace("webcal://", "https://")
+        return icalendar.Calendar.from_ical(http_get(url)) if url else None
+    merged = icalendar.Calendar()
+    start = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    for cal in principal.calendars():
+        try:
+            # Recurring masters are returned if any occurrence overlaps; we expand them below
+            found = cal.search(start=start, end=start + timedelta(days=2), event=True)
+        except Exception as e:
+            print(f"  ! calendar {cal.get_display_name()} skipped: {e}")
+            continue
+        for obj in found:
+            for component in icalendar.Calendar.from_ical(obj.data).walk():
+                if component.name in ("VEVENT", "VTIMEZONE"):
+                    merged.add_component(component)
+    return merged
+
+
+def fetch_calendar():
+    """Today's and tomorrow's events, as {date: [(time label, title), ...]}."""
+    cal = load_calendar()
+    if cal is None:
+        return None
     today = datetime.now(TZ).date()
     days = {}
     for day in (today, today + timedelta(days=1)):
@@ -160,6 +193,38 @@ def fetch_calendar():
         # All-day and continuing events first, then by time
         days[day] = sorted(events, key=lambda e: (e[0][0].isdigit(), e[0]))
     return days
+
+
+def briefing_calendar(principal):
+    """The app's own calendar for events it creates, made on first use so they're easy to hide."""
+    for cal in principal.calendars():
+        if cal.get_display_name() == WRITE_CALENDAR:
+            return cal
+    return principal.make_calendar(name=WRITE_CALENDAR)
+
+
+def add_event(summary, start, end, description="", uid=None):
+    """Create (or update, if uid already exists) an event in the app's calendar.
+
+    Pass a stable uid (e.g. "climbing-2026-10-23") so re-running the script doesn't duplicate events.
+    start/end are timezone-aware datetimes, or dates for an all-day event.
+    """
+    principal = caldav_principal()
+    if principal is None:
+        raise RuntimeError("Writing events needs ICLOUD_USERNAME and ICLOUD_APP_PASSWORD")
+    event = icalendar.Event()
+    event.add("uid", uid or f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}@morning-news")
+    event.add("dtstamp", datetime.now(timezone.utc))
+    event.add("dtstart", start)
+    event.add("dtend", end)
+    event.add("summary", summary)
+    if description:
+        event.add("description", description)
+    cal = icalendar.Calendar()
+    cal.add("prodid", "-//Morning News//EN")
+    cal.add("version", "2.0")
+    cal.add_component(event)
+    return briefing_calendar(principal).add_event(cal.to_ical().decode())
 
 
 def fetch_weather():
@@ -326,7 +391,7 @@ def main():
     calendar = weather = None
     try:
         calendar = fetch_calendar()
-        print("Calendar: " + ("skipped (no ICAL_URL)" if calendar is None else
+        print("Calendar: " + ("skipped (not configured)" if calendar is None else
                               ", ".join(f"{len(e)} events" for e in calendar.values())))
     except Exception as e:
         print(f"  ! calendar failed: {e}")
