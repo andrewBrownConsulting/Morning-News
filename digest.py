@@ -31,8 +31,8 @@ FEEDS = {
 TOP_N = 10
 MAX_AGE = timedelta(hours=24)
 BATCH_SIZE = 50
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+MODELS_URL = "https://models.github.ai/inference/chat/completions"
+MODEL = os.environ.get("MODEL", "openai/gpt-4o-mini")
 ATOM = "{http://www.w3.org/2005/Atom}"
 
 
@@ -119,12 +119,12 @@ def score_batch(stories, profile, api_key):
         'Reply with JSON only: {"scores": [{"id": 0, "score": 7, "reason": "..."}, ...]}'
     )
     body = json.dumps({
-        "model": GROQ_MODEL,
+        "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"},
         "temperature": 0.2,
     }).encode()
-    req = urllib.request.Request(GROQ_URL, data=body, headers={
+    req = urllib.request.Request(MODELS_URL, data=body, headers={
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "User-Agent": "news-digest/0.1",
@@ -179,13 +179,13 @@ def send_email(subject, body_html):
 def main():
     load_dotenv()
     dry_run = "--dry-run" in sys.argv
-    api_key = os.environ.get("GROQ_API_KEY")
+    api_key = os.environ.get("GITHUB_TOKEN")
     if not api_key:
-        sys.exit("GROQ_API_KEY is not set (add it to .env or GitHub secrets)")
+        sys.exit("GITHUB_TOKEN is not set (automatic in GitHub Actions; locally, add a PAT with models:read to .env)")
 
     print("Fetching feeds...")
     stories = fetch_all()
-    print(f"Scoring {len(stories)} stories with {GROQ_MODEL}...")
+    print(f"Scoring {len(stories)} stories with {MODEL}...")
     picks = score_all(stories, (HERE / "profile.txt").read_text(), api_key)
     if not picks:
         sys.exit("No stories were scored, so there's nothing to send")
